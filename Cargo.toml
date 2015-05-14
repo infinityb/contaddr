@@ -1,0 +1,10 @@
+[package]
+name = "contaddr"
+version = "0.1.0"
+authors = ["Stacey Ell <stacey.ell@gmail.com>"]
+
+[dependencies]
+libc = "*"
+rustc-serialize = "0.3"
+openssl = "0.6"
+rand = "0.3"
