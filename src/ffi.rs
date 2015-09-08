@@ -28,6 +28,11 @@ mod internal {
             flags: c_int,
             mode: mode_t) -> c_int;
 
+        pub fn unlinkat(
+            dirfd: c_int,
+            pathname: *const c_char,
+            flags: c_int) -> c_int;
+
         pub fn fchmod(
             fd: c_int,
             mode: mode_t) -> c_int;
@@ -83,7 +88,8 @@ pub fn mkdirat<P: AsRef<Path>>(
     let cpathname = try!(cstr(pathname.as_ref()));
     match unsafe { internal::mkdirat(dirfd, cpathname.as_ptr(), mode) } {
         -1 => Err(last_error_wpath(pathname.as_ref())),
-        _ => Ok(())
+        0 => Ok(()),
+        _ => unreachable!(),
     }
 }
 
@@ -101,11 +107,25 @@ pub fn openat<P: AsRef<Path>>(
     }
 }
 
+pub fn unlinkat<P: AsRef<Path>>(
+    dirfd: RawFd,
+    pathname: P,
+    flags: c_int,
+) -> io::Result<()> {
+    let cpathname = try!(cstr(pathname.as_ref()));
+    let rv = unsafe { internal::unlinkat(dirfd, cpathname.as_ptr(), flags) };
+    match rv {
+        -1 => Err(last_error_wpath(pathname.as_ref())),
+        0 => Ok(()),
+        _ => unreachable!(),
+    }
+}
 pub fn fchmod(dirfd: RawFd, mode: mode_t) -> io::Result<()> {
     let rv = unsafe { internal::fchmod(dirfd, mode) };
     match rv {
         -1 => Err(last_error()),
-        _ => Ok(()),
+        0 => Ok(()),
+        _ => unreachable!(),
     }
 }
 

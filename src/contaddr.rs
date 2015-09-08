@@ -2,18 +2,44 @@ use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::os::unix::io::{RawFd, AsRawFd, FromRawFd};
 use std::fs::{File, Metadata};
 use std::path::Path;
+use time::{self, Duration};
 
 const AT_FDCWD: libc::c_int =  -100;
 const AT_SYMLINK_FOLLOW: libc::c_int = 0o2000;
 
-const O_PATH: libc::c_int = 0o10000000;
 const O_TMPFILE: libc::c_int = 0o20200000;
 const O_CLOEXEC: libc::c_int =  0o2000000;
 const O_DIRECTORY: libc::c_int =   0o200000;
 
-use ::libc::{self, c_int, O_RDWR};
-use ::openssl::crypto::hash::{Hasher, Type};
+use ::libc::{self, c_int, O_RDONLY, O_RDWR};
+use ::openssl::crypto::hash::Hasher;
+use ::HashType;
 use ::rustc_serialize::hex::ToHex;
+
+
+#[derive(Debug)]
+struct ValidationStats {
+    open_latency: Duration,
+    check_latency: Duration,
+}
+
+fn span_result<F, T, E>(f: F) -> Result<(Duration, T), E> where F: FnOnce() -> Result<T, E> {
+    let before = time::precise_time_ns();
+    match f() {
+        Ok(ok) => {
+            let dur = Duration::nanoseconds((time::precise_time_ns() - before) as i64);
+            Ok((dur, ok))
+        },
+        Err(err) => Err(err),
+    }
+}
+
+#[allow(dead_code)]
+fn span_value<F, R>(f: F) -> (Duration, R) where F: FnOnce() -> R {
+    let before = time::precise_time_ns();
+    let r = f();
+    (Duration::nanoseconds((time::precise_time_ns() - before) as i64), r)
+}
 
 #[derive(Debug)]
 struct Directory(RawFd);
@@ -35,23 +61,40 @@ fn create_linkable_at(dir: &Directory) -> io::Result<File> {
         .map(|fd| unsafe { FromRawFd::from_raw_fd(fd) })
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Address(String);
+
+impl Address {
+    pub fn as_hex(&self) -> String {
+        self.0.clone()
+    }
+}
+
+pub struct Staged {
+    tmpfile: TempFile,
+    address: Address,
+}
+
+impl Staged {
+    pub fn get_address(&self) -> &Address {
+        &self.address
+    }
+}
 
 pub struct ContAddr {
     dir: Directory,
-    digest: Type,
+    digest: HashType,
 }
 
 impl ContAddr {
-    pub fn open<P: AsRef<Path>>(dir: P, digest: Type) -> io::Result<ContAddr> {
+    pub fn open<P: AsRef<Path>>(dir: P, digest: HashType) -> io::Result<ContAddr> {
         let contaddr = Directory::open(dir).map(|d| ContAddr { dir: d, digest: digest });
         if let Ok(ref contaddr) = contaddr {
             let mut buffer: [u8; 2] = [0; 2];
             for i in 0..256 {
-                write!(&mut io::Cursor::new(&mut buffer[..]), "{:02x}", i);
+                try!(write!(&mut io::Cursor::new(&mut buffer[..]), "{:02x}", i));
                 let filename = ::std::str::from_utf8(&buffer).unwrap();
-                contaddr.mkdir(filename).unwrap();
+                try!(contaddr.mkdir(filename))
             }
         }
         contaddr
@@ -82,30 +125,66 @@ impl ContAddr {
         }
     }
 
-    pub fn commit(&self, mut target: TempFile) -> io::Result<Address> {
+    pub fn stage(&self, mut target: TempFile) -> io::Result<Staged> {
         try!(target.seek(SeekFrom::Start(0)));
         let address = {
             let mut h = Hasher::new(self.digest);
             try!(io::copy(&mut target, &mut h));
             h.finish().to_hex()
         };
+        Ok(Staged {
+            tmpfile: target,
+            address: Address(address),
+        })
+    }
 
+    pub fn commit(&self, staged: Staged) -> io::Result<()> {
         let Directory(dir_fd) = self.dir;
-        let proc_filename = format!("/proc/self/fd/{}", target.0.as_raw_fd());
-        let target_filename = format!("./{}/{}", &address[0..2], address);
-        try!(::ffi::fchmod(target.0.as_raw_fd(), 0o644));
+        let hex_addr = staged.address.as_hex();
+        let proc_filename = format!("/proc/self/fd/{}", staged.tmpfile.0.as_raw_fd());
+        let target_filename = format!("./{}/{}", &hex_addr[0..2], &hex_addr);
+
+        try!(::ffi::fchmod(staged.tmpfile.0.as_raw_fd(), 0o644));
         let linkat_rv = ::ffi::linkat(
             AT_FDCWD, &proc_filename,
             dir_fd, &target_filename,
             AT_SYMLINK_FOLLOW);
         
         linkat_rv
-            .map(|()| Address(address))
             .map_err(|e| if e.kind() == io::ErrorKind::AlreadyExists {
                 io::Error::new(io::ErrorKind::AlreadyExists, target_filename)
             } else {
                 e
             })
+    }
+
+    pub fn validate_read(&self, address: &str) -> io::Result<File> {
+        let (open_latency, mut target) = try!(span_result(|| self.read(address)));
+
+        let (check_latency, is_valid) = try!(span_result(|| -> Result<_, io::Error> {
+            let mut h = Hasher::new(self.digest);
+            try!(io::copy(&mut target, &mut h));
+            Ok(h.finish().to_hex() == address)
+        }));
+        println!("validation stats: {:?}", ValidationStats {
+            open_latency: open_latency,
+            check_latency: check_latency
+        });
+        if !is_valid {
+            let Directory(dir_fd) = self.dir;
+            let filename = format!("./{}/{}", &address[0..2], &address);
+            try!(::ffi::unlinkat(dir_fd, filename, 0));
+            return Err(io::Error::new(io::ErrorKind::Other, "Hash mismatch!"));
+        }
+        try!(target.seek(SeekFrom::Start(0)));
+        Ok(target)
+    }
+
+    pub fn read(&self, address: &str) -> io::Result<File> {
+        let Directory(dir_fd) = self.dir;
+        let filename = format!("./{}/{}", &address[0..2], &address);
+        let raw_fd = try!(::ffi::openat(dir_fd, filename, O_RDONLY, 0o000));
+        Ok(unsafe { FromRawFd::from_raw_fd(raw_fd) })
     }
 }
 
@@ -169,14 +248,16 @@ mod tests {
     #[test]
     fn random_test() {
         // This fails in a test for some reason. It works outside. ???
-        
+
         let buf = random_buffer(100 * 1024);
 
-        let contaddr = ContAddr::open("/tmp/x").unwrap();
+        let contaddr = ContAddr::open("/tmp/x", ::HashType::MD5).unwrap();
 
         let mut wri = contaddr.create().unwrap();
         io::copy(&mut io::Cursor::new(&buf[..]), &mut wri).unwrap();
-        contaddr.commit(wri).unwrap();
+        let staged = contaddr.stage(wri).unwrap();
+        ::std::thread::sleep_ms(20000);
+        contaddr.commit(staged).unwrap();
     }
 }
 

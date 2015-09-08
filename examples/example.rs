@@ -21,7 +21,8 @@ fn main() {
         let buf = random_buffer(40 * 1024);
         let mut wri = contaddr.create().unwrap();
         io::copy(&mut io::Cursor::new(&buf[..]), &mut wri).unwrap();
-        contaddr.commit(wri).unwrap();
+        let staged = contaddr.stage(wri).unwrap();
+        contaddr.commit(staged).unwrap();
     }
 
 }
